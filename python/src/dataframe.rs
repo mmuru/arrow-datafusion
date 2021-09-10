@@ -22,7 +22,7 @@ use pyo3::{prelude::*, types::PyTuple};
 use tokio::runtime::Runtime;
 
 use datafusion::execution::context::ExecutionContext as _ExecutionContext;
-use datafusion::logical_plan::{JoinType, LogicalPlanBuilder};
+use datafusion::logical_plan::{normalize_cols, Expr, JoinType, LogicalPlanBuilder};
 use datafusion::physical_plan::collect;
 use datafusion::{execution::context::ExecutionContextState, logical_plan};
 
@@ -46,16 +46,111 @@ impl DataFrame {
     }
 }
 
+/// TODO: this functions belongs to datafusion::sql::planner and datafusion::sql::utils but right now there are private to the datafusion crate
+pub(crate) fn find_window_exprs(exprs: &[Expr]) -> Vec<Expr> {
+    exprs
+        .into_iter()
+        .map(|e| match e {
+            Expr::WindowFunction { .. } => vec![e.clone()],
+            Expr::Alias(e, _) => find_window_exprs(&vec![*e.clone()]),
+            _ => vec![],
+        })
+        .flatten()
+        .collect::<Vec<_>>()
+}
+
+type WindowSortKey = Vec<Expr>;
+
+/// Generate a sort key for a given window expr's partition_by and order_bu expr
+fn generate_sort_key(partition_by: &[Expr], order_by: &[Expr]) -> WindowSortKey {
+    let mut sort_key = vec![];
+    partition_by.iter().for_each(|e| {
+        let e = e.clone().sort(true, true);
+        if !sort_key.contains(&e) {
+            sort_key.push(e);
+        }
+    });
+    order_by.iter().for_each(|e| {
+        if !sort_key.contains(e) {
+            sort_key.push(e.clone());
+        }
+    });
+    sort_key
+}
+
+/// group a slice of window expression expr by their order by expressions
+pub fn group_window_expr_by_sort_keys(
+    window_expr: &[Expr],
+) -> Result<Vec<(WindowSortKey, Vec<&Expr>)>, DataFusionError> {
+    let mut result = vec![];
+    window_expr.iter().try_for_each(|expr| match expr {
+        Expr::WindowFunction { partition_by, order_by, .. } => {
+            let sort_key = generate_sort_key(partition_by, order_by);
+            if let Some((_, values)) = result.iter_mut().find(
+                |group: &&mut (WindowSortKey, Vec<&Expr>)| matches!(group, (key, _) if *key == sort_key),
+            ) {
+                values.push(expr);
+            } else {
+                result.push((sort_key, vec![expr]))
+            }
+            Ok(())
+        }
+        other => Err(DataFusionError::Common(format!(
+            "Impossibly got non-window expr {:?}",
+            other,
+        ))),
+    })?;
+    Ok(result)
+}
+
+fn wrap_window(
+    input: LogicalPlan,
+    window_exprs: Vec<Expr>,
+) -> Result<LogicalPlan, DataFusionError> {
+    let mut plan = input;
+    let mut groups = group_window_expr_by_sort_keys(&window_exprs[..])?;
+    // sort by sort_key len descending, so that more deeply sorted plans gets nested further
+    // down as children; to further mimic the behavior of PostgreSQL, we want stable sort
+    // and a reverse so that tieing sort keys are reversed in order; note that by this rule
+    // if there's an empty over, it'll be at the top level
+    groups.sort_by(|(key_a, _), (key_b, _)| key_a.len().cmp(&key_b.len()));
+    groups.reverse();
+    for (_, exprs) in groups {
+        let window_exprs =
+            normalize_cols(exprs.into_iter().cloned().collect::<Vec<_>>(), &plan)?;
+        // the partition and sort itself is done at physical level, see physical_planner's
+        // fn create_initial_plan
+        plan = LogicalPlanBuilder::from(plan)
+            .window(window_exprs.clone())?
+            .build()?;
+    }
+    Ok(plan)
+}
+
 #[pymethods]
 impl DataFrame {
     /// Select `expressions` from the existing DataFrame.
     #[args(args = "*")]
     fn select(&self, args: &PyTuple) -> PyResult<Self> {
         let expressions = expression::from_tuple(args)?;
-        let builder = LogicalPlanBuilder::from(self.plan.clone());
-        let builder =
-            errors::wrap(builder.project(expressions.into_iter().map(|e| e.expr)))?;
-        let plan = errors::wrap(builder.build())?;
+
+        let exprs = expressions.into_iter().map(|x| x.expr).collect::<Vec<_>>();
+        let window_func_exprs = find_window_exprs(&exprs[..]);
+
+        // if we found some window func expression inside select expr
+        // we need to wrap the plan into a LogicalPlan::Window
+        let plan = if window_func_exprs.is_empty() {
+            self.plan.clone()
+        } else {
+            wrap_window(self.plan.clone(), window_func_exprs)?
+        };
+
+        let plan = errors::wrap(
+            LogicalPlanBuilder::from(plan.clone())
+                .project(exprs)
+                .map_err(|e| -> errors::DataFusionError { e.into() })?
+                .build(),
+        )?;
 
         Ok(DataFrame {
             ctx_state: self.ctx_state.clone(),

@@ -110,3 +110,14 @@ def test_join():
 
     expected = {"a": [1, 2], "c": [8, 10], "b": [4, 5]}
     assert table.to_pydict() == expected
+
+def test_lead(df):
+    df = df.select(
+        f.col("a"),
+        f.alias(f.window("lead", [f.col("b")], order_by=[f.order_by(f.col("b"))]), "a_next"),
+    )
+
+    table = pa.Table.from_batches(df.collect())
+
+    expected = {"a": [1, 2, 3], "a_next": [5, 6, None]}
+    assert table.to_pydict() == expected

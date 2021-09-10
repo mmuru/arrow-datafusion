@@ -65,6 +65,15 @@ def data_date32():
         data, type=pa.date32(), mask=np.array([False, True, False])
     )
 
+def data_date64():
+    data = [
+        datetime.date(2000, 1, 1),
+        datetime.date(1980, 1, 1),
+        datetime.date(2030, 1, 1),
+    ]
+    return pa.array(
+        data, type=pa.date64(), mask=np.array([False, True, False])
+    )
 
 def data_timedelta(f):
     data = [

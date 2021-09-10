@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::errors;
 use crate::udaf;
 use crate::udf;
 use crate::{expression, types::PyDataType};
@@ -261,9 +262,67 @@ fn udaf(
     })
 }
 
+/// Creates a new Sort expression
+#[pyfunction]
+fn order_by(
+    expr: expression::Expression,
+    asc: Option<bool>,
+    nulls_first: Option<bool>,
+) -> PyResult<expression::Expression> {
+    Ok(expression::Expression {
+        expr: datafusion::logical_plan::Expr::Sort {
+            expr: Box::new(expr.expr),
+            asc: asc.unwrap_or(true),
+            nulls_first: nulls_first.unwrap_or(true),
+        },
+    })
+}
+
+/// Creates a new Alias expression
+#[pyfunction]
+fn alias(expr: expression::Expression, name: &str) -> PyResult<expression::Expression> {
+    Ok(expression::Expression {
+        expr: datafusion::logical_plan::Expr::Alias(
+            Box::new(expr.expr),
+            String::from(name),
+        ),
+    })
+}
+
+/// Creates a new Window function expression
+#[pyfunction]
+fn window(
+    name: &str,
+    args: Vec<expression::Expression>,
+    partition_by: Option<Vec<expression::Expression>>,
+    order_by: Option<Vec<expression::Expression>>,
+) -> PyResult<expression::Expression> {
+    use std::str::FromStr;
+    let fun = datafusion::physical_plan::window_functions::WindowFunction::from_str(name)
+        .map_err(|e| -> errors::DataFusionError { e.into() })?;
+    Ok(expression::Expression {
+        expr: datafusion::logical_plan::Expr::WindowFunction {
+            fun,
+            args: args.into_iter().map(|x| x.expr).collect::<Vec<_>>(),
+            partition_by: partition_by
+                .unwrap_or(vec![])
+                .into_iter()
+                .map(|x| x.expr)
+                .collect::<Vec<_>>(),
+            order_by: order_by
+                .unwrap_or(vec![])
+                .into_iter()
+                .map(|x| x.expr)
+                .collect::<Vec<_>>(),
+            window_frame: None,
+        },
+    })
+}
+
 pub fn init(module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(abs, module)?)?;
     module.add_function(wrap_pyfunction!(acos, module)?)?;
+    module.add_function(wrap_pyfunction!(alias, module)?)?;
     module.add_function(wrap_pyfunction!(array, module)?)?;
     module.add_function(wrap_pyfunction!(ascii, module)?)?;
     module.add_function(wrap_pyfunction!(asin, module)?)?;
@@ -296,6 +355,7 @@ pub fn init(module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(min, module)?)?;
     module.add_function(wrap_pyfunction!(now, module)?)?;
     module.add_function(wrap_pyfunction!(octet_length, module)?)?;
+    module.add_function(wrap_pyfunction!(order_by, module)?)?;
     module.add_function(wrap_pyfunction!(random, module)?)?;
     module.add_function(wrap_pyfunction!(regexp_replace, module)?)?;
     module.add_function(wrap_pyfunction!(repeat, module)?)?;
@@ -325,6 +385,7 @@ pub fn init(module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(udaf, module)?)?;
     module.add_function(wrap_pyfunction!(udf, module)?)?;
     module.add_function(wrap_pyfunction!(upper, module)?)?;
+    module.add_function(wrap_pyfunction!(window, module)?)?;
 
     Ok(())
 }

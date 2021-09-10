@@ -37,7 +37,10 @@ def test_register_record_batches(ctx):
 
     assert ctx.tables() == {"t"}
 
-    result = ctx.sql("SELECT a+b, a-b FROM t").collect()
+    result = ctx.sql(
+        "SELECT a+b, a-b, lead(b) over (order by b) as b_next  FROM t"
+    ).collect()
 
     assert result[0].column(0) == pa.array([5, 7, 9])
     assert result[0].column(1) == pa.array([-3, -3, -3])
+    assert result[0].column(2) == pa.array([5, 6, None])
